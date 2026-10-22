@@ -10,9 +10,13 @@
     · /알림해제  : 이 서버의 채널 알림 끄기
     · /알림구독  : 나에게 DM으로 알림,  /알림구독해제
 
-환경변수: DISCORD_TOKEN (필수), PORT (선택: 지정하면 상태 확인용 웹페이지를 띄움)
+환경변수: DISCORD_TOKEN (필수)
+         STORAGE_CHANNEL_ID (선택: 알림 설정을 이 채널에 백업 → 재시작해도 유지)
+         NOTIFY_CHANNEL_IDS (선택: 항상 알림 보낼 채널 고정)
+         PORT (선택: 지정하면 상태 확인용 웹페이지를 띄움)
 """
 import asyncio
+import io
 import json
 import os
 from datetime import date, time as dtime, timedelta
@@ -113,6 +117,50 @@ class MealBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.data = load_data()
 
+    # ---- 설정을 디스코드 채널에 저장 (Render 처럼 파일이 지워지는 서버 대비) ----
+    STORE_NAME = "mealbot_data.json"
+
+    async def _store_channel(self):
+        cid = os.environ.get("STORAGE_CHANNEL_ID")
+        if not cid:
+            return None
+        try:
+            return self.get_channel(int(cid)) or await self.fetch_channel(int(cid))
+        except discord.HTTPException as e:
+            print(f"[store] 저장 채널 접근 실패: {e}", flush=True)
+            return None
+
+    async def load_remote(self):
+        ch = await self._store_channel()
+        if not ch:
+            return
+        async for m in ch.history(limit=50):
+            if m.author.id == self.user.id:
+                for a in m.attachments:
+                    if a.filename == self.STORE_NAME:
+                        d = json.loads(await a.read())
+                        d.setdefault("channels", {})
+                        d.setdefault("dm_users", [])
+                        self.data = d
+                        save_data(d)
+                        print(f"[store] 설정 복원: 채널 {len(d['channels'])}개, DM {len(d['dm_users'])}명", flush=True)
+                        return
+
+    async def persist(self):
+        save_data(self.data)
+        ch = await self._store_channel()
+        if not ch:
+            return
+        raw = json.dumps(self.data, ensure_ascii=False, indent=2).encode("utf-8")
+        try:
+            new = await ch.send("급식봇 설정 백업 (지우지 마세요)",
+                                file=discord.File(io.BytesIO(raw), filename=self.STORE_NAME))
+            async for m in ch.history(limit=50):  # 이전 백업 정리
+                if m.author.id == self.user.id and m.id != new.id and m.attachments:
+                    await m.delete()
+        except discord.HTTPException as e:
+            print(f"[store] 백업 실패: {e}", flush=True)
+
     async def setup_hook(self):
         self.add_view(MealButtons())
         await self.tree.sync()
@@ -123,6 +171,9 @@ class MealBot(discord.Client):
 
     async def on_ready(self):
         print(f"[bot] 로그인: {self.user} / 서버 {len(self.guilds)}개", flush=True)
+        if not getattr(self, "_restored", False):
+            self._restored = True
+            await self.load_remote()
 
     # 멘션 또는 DM 자연어
     async def on_message(self, msg: discord.Message):
@@ -170,6 +221,7 @@ class MealBot(discord.Client):
     @notify_loop.before_loop
     async def _wait_ready(self):
         await self.wait_until_ready()
+        await asyncio.sleep(5)  # 저장소 복원 대기
 
     # 오늘/내일 식단 미리 받아두기
     @tasks.loop(minutes=30)
@@ -223,7 +275,7 @@ _make_single("저녁", "석식")
 @app_commands.guild_only()
 async def cmd_notify_on(inter: discord.Interaction):
     bot.data["channels"][str(inter.guild_id)] = inter.channel_id
-    save_data(bot.data)
+    await bot.persist()
     await inter.response.send_message(
         f"✅ 이제 {inter.channel.mention} 에 매일 🌅06:30 아침 · ☀️11:30 점심 · 🌙17:30 저녁 메뉴를 보낼게요.")
 
@@ -233,7 +285,7 @@ async def cmd_notify_on(inter: discord.Interaction):
 @app_commands.guild_only()
 async def cmd_notify_off(inter: discord.Interaction):
     removed = bot.data["channels"].pop(str(inter.guild_id), None)
-    save_data(bot.data)
+    await bot.persist()
     await inter.response.send_message("🔕 알림을 껐어요." if removed else "설정된 알림이 없어요.")
 
 
@@ -241,7 +293,7 @@ async def cmd_notify_off(inter: discord.Interaction):
 async def cmd_dm_on(inter: discord.Interaction):
     if inter.user.id not in bot.data["dm_users"]:
         bot.data["dm_users"].append(inter.user.id)
-        save_data(bot.data)
+        await bot.persist()
     await inter.response.send_message("✅ 매일 06:30 · 11:30 · 17:30 에 DM으로 보내드릴게요. "
                                       "(서버 설정에서 DM 허용이 켜져 있어야 해요)", ephemeral=True)
 
@@ -250,7 +302,7 @@ async def cmd_dm_on(inter: discord.Interaction):
 async def cmd_dm_off(inter: discord.Interaction):
     if inter.user.id in bot.data["dm_users"]:
         bot.data["dm_users"].remove(inter.user.id)
-        save_data(bot.data)
+        await bot.persist()
     await inter.response.send_message("🔕 DM 알림을 껐어요.", ephemeral=True)
 
 
